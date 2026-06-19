@@ -1,6 +1,6 @@
 # Streamlit Community Cloud installs from this file.
-# Live market data path: pykrx (daily OHLCV) + OpenDartReader (DART fundamentals).
-# Anthropic is intentionally excluded so a public link incurs no API cost.
+# Live data: pykrx (OHLCV) + OpenDartReader (DART) + httpx/bs4 (Naver news).
+# Anthropic intentionally excluded so a public link incurs no API cost.
 streamlit>=1.36
 pandas>=2.1
 numpy>=1.26
@@ -11,3 +11,5 @@ python-dotenv>=1.0
 pykrx>=1.0.45
 OpenDartReader>=0.2.1
 lxml>=5.0
+httpx>=0.27
+beautifulsoup4>=4.12

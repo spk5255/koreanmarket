@@ -1,10 +1,4 @@
-"""Streamlit dashboard — Robinhood-style, Korean, REAL market data.
-
-On first load it tries live ingestion (pykrx daily OHLCV + DART fundamentals)
-and falls back to synthetic data if the host can't reach KRX/DART, so the link
-never breaks. The DART key is read from Streamlit secrets if present.
-No Anthropic calls are made, so a public link incurs no API cost.
-"""
+"""Streamlit dashboard — Robinhood-style, Korean, real data, with reasoning."""
 
 from __future__ import annotations
 
@@ -23,7 +17,6 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("streamlit not installed. pip install -e '.[dashboard]'") from exc
 
-# Bridge a Streamlit secret -> env BEFORE settings is imported, so live DART works on host.
 try:
     if "DART_API_KEY" in st.secrets and not os.environ.get("DART_API_KEY"):
         os.environ["DART_API_KEY"] = str(st.secrets["DART_API_KEY"])
@@ -33,9 +26,11 @@ except Exception:
 from sqlalchemy import func, select
 
 from config.settings import DATA_DIR
+from src.analysis.explain import build_reasoning
+from src.ingestion.news import fetch_naver_news
 from src.storage.db import init_db, session_scope
 from src.storage.models import Company, FactorScore, Price, Projection
-from src.storage.repository import get_prices
+from src.storage.repository import get_flows, get_fundamentals, get_prices
 from src.utils import iso_week_label
 
 DEMO_YEARS = 1.5
@@ -49,21 +44,18 @@ CONF_KO = {"low": "낮음", "medium": "보통", "high": "높음"}
 FACTOR_KO = {"fundamental": "펀더멘털", "technical": "기술적", "supply_demand": "수급", "sentiment": "심리"}
 
 
-# ----------------------------------------------------------------- bootstrap ---
-
 @st.cache_resource(show_spinner="시장 데이터를 불러오는 중… (최초 1회, 실데이터는 다소 걸릴 수 있어요)")
 def bootstrap() -> tuple[str, str]:
     init_db()
     week = iso_week_label(date.today())
     with session_scope() as s:
         n_prices = s.scalar(select(func.count()).select_from(Price)) or 0
-
     if n_prices == 0:
         source = "real"
         try:
             from src.ingestion.backfill import backfill_universe
             if backfill_universe(years=REAL_YEARS, with_financials=True) == 0:
-                raise RuntimeError("no real data returned")
+                raise RuntimeError("no real data")
         except Exception:
             from scripts.seed_synthetic import main as seed_main
             sys.argv = ["seed_synthetic", "--years", str(DEMO_YEARS), "--seed", "42"]
@@ -75,7 +67,6 @@ def bootstrap() -> tuple[str, str]:
             pass
     else:
         source = MARKER.read_text(encoding="utf-8").strip() if MARKER.exists() else "real"
-
     with session_scope() as s:
         n_week = s.scalar(select(func.count()).select_from(Projection).where(Projection.week == week)) or 0
     if n_week == 0:
@@ -113,12 +104,31 @@ def load_prices(ticker: str) -> pd.DataFrame:
         df = get_prices(s, ticker)
     if df.empty:
         return df
-    df = df.tail(120).copy()
+    df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     return df
 
 
-# --------------------------------------------------------------------- style ---
+@st.cache_data(ttl=120)
+def load_fundamentals(ticker: str) -> pd.DataFrame:
+    with session_scope() as s:
+        return get_fundamentals(s, ticker)
+
+
+@st.cache_data(ttl=120)
+def load_flows(ticker: str) -> pd.DataFrame:
+    with session_scope() as s:
+        return get_flows(s, ticker)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_news(ticker: str) -> list[dict]:
+    try:
+        items = fetch_naver_news(ticker, limit=8)
+    except Exception:
+        return []
+    return [{"title": it.title, "url": it.url} for it in items]
+
 
 def inject_css() -> None:
     st.markdown(f"""
@@ -131,8 +141,8 @@ def inject_css() -> None:
     .block-container {{ padding-top: 1.5rem; padding-bottom: 3rem; max-width: 880px; }}
     .rh-title {{ font-size: 1.6rem; font-weight: 800; color: #fff; letter-spacing: -0.5px; }}
     .rh-sub {{ color: {MUTED}; font-size: 0.85rem; margin-top: 2px; }}
-    .rh-badge {{ display:inline-block; font-size:0.72rem; font-weight:700; padding:2px 9px;
-                border-radius:20px; margin-left:6px; }}
+    .rh-badge {{ display:inline-block; font-size:0.72rem; font-weight:700; padding:2px 9px; border-radius:20px; margin-left:6px; }}
+    .rh-sec {{ font-size:0.95rem;color:#fff;font-weight:700;margin:6px 0 8px; }}
     .rh-stat-label {{ color: {MUTED}; font-size: 0.78rem; font-weight: 500; }}
     .rh-stat-value {{ color: #fff; font-size: 1.9rem; font-weight: 700; letter-spacing: -1px; line-height: 1.1; }}
     .rh-card {{ background: #131720; border: 1px solid #1f2429; border-radius: 14px; padding: 6px 14px; }}
@@ -142,13 +152,20 @@ def inject_css() -> None:
     .rh-ticker {{ color:{MUTED}; font-size:0.74rem; margin-top:1px; }}
     .rh-score {{ font-weight:700; font-size:1.15rem; text-align:right; }}
     .rh-prob {{ font-size:0.78rem; font-weight:600; text-align:right; margin-top:1px; }}
-    .rh-chip {{ display:inline-block; background:#131720; border:1px solid #1f2429; border-radius:10px;
-               padding:8px 14px; margin-right:8px; margin-bottom:6px; }}
+    .rh-chip {{ display:inline-block; background:#131720; border:1px solid #1f2429; border-radius:10px; padding:8px 14px; margin-right:8px; margin-bottom:6px; }}
     .rh-chip-label {{ color:{MUTED}; font-size:0.7rem; }}
     .rh-chip-val {{ color:#fff; font-weight:700; font-size:1.05rem; }}
     .rh-bar-track {{ background:#1a1f25; border-radius:6px; height:8px; width:100%; overflow:hidden; }}
     .rh-bar-fill {{ background:{GREEN}; height:8px; border-radius:6px; }}
     .rh-bar-label {{ color:{MUTED}; font-size:0.8rem; display:flex; justify-content:space-between; margin:10px 0 4px; }}
+    .rh-drv {{ padding:7px 4px; border-bottom:1px solid #1a1f25; font-size:0.88rem; }}
+    .rh-drv:last-child {{ border-bottom:none; }}
+    .rh-fin {{ display:flex; justify-content:space-between; padding:7px 4px; border-bottom:1px solid #1a1f25; font-size:0.88rem; }}
+    .rh-fin:last-child {{ border-bottom:none; }}
+    .rh-news {{ padding:8px 4px; border-bottom:1px solid #1a1f25; font-size:0.86rem; }}
+    .rh-news:last-child {{ border-bottom:none; }}
+    .rh-news a {{ color:#cfd3d8; text-decoration:none; }}
+    .rh-news a:hover {{ color:{GREEN}; }}
     .rh-disclaimer {{ color:#6b7280; font-size:0.72rem; margin-top:14px; }}
     div[data-baseweb="select"] > div {{ background:#131720; border-color:#1f2429; }}
     </style>
@@ -174,44 +191,32 @@ def render_ranking(df: pd.DataFrame) -> None:
         arrow = "▲" if up else "▼"
         prob = f"{r['prob_up']:.0%}" if pd.notna(r["prob_up"]) else "—"
         rows_html += (
-            f'<div class="rh-row">'
-            f'<div><div class="rh-name">{r["name"]}</div><div class="rh-ticker">{r["ticker"]}</div></div>'
+            f'<div class="rh-row"><div><div class="rh-name">{r["name"]}</div>'
+            f'<div class="rh-ticker">{r["ticker"]}</div></div>'
             f'<div><div class="rh-score" style="color:{c}">{r["composite"]:.1f}</div>'
-            f'<div class="rh-prob" style="color:{pc}">{arrow} 상승확률 {prob}</div></div>'
-            f'</div>'
+            f'<div class="rh-prob" style="color:{pc}">{arrow} 상승확률 {prob}</div></div></div>'
         )
     st.markdown(f'<div class="rh-card">{rows_html}</div>', unsafe_allow_html=True)
 
 
 def render_price_chart(ticker: str) -> None:
-    pdf = load_prices(ticker)
+    pdf = load_prices(ticker).tail(120)
     if pdf.empty:
         return
     up = pdf["close"].iloc[-1] >= pdf["close"].iloc[0]
     color = GREEN if up else RED
     ret = pdf["close"].iloc[-1] / pdf["close"].iloc[0] - 1
     area = (
-        alt.Chart(pdf)
-        .mark_area(
+        alt.Chart(pdf).mark_area(
             line={"color": color, "size": 2},
-            color=alt.Gradient(
-                gradient="linear",
-                stops=[alt.GradientStop(color="#0a0a0a", offset=0),
-                       alt.GradientStop(color=color, offset=1)],
-                x1=1, x2=1, y1=1, y2=0,
-            ),
-            opacity=0.25,
-        )
+            color=alt.Gradient(gradient="linear",
+                stops=[alt.GradientStop(color="#0a0a0a", offset=0), alt.GradientStop(color=color, offset=1)],
+                x1=1, x2=1, y1=1, y2=0), opacity=0.25)
         .encode(x=alt.X("date:T", axis=None), y=alt.Y("close:Q", axis=None, scale=alt.Scale(zero=False)))
-        .properties(height=170)
-        .configure_view(strokeWidth=0)
-        .configure(background="#0a0a0a")
+        .properties(height=170).configure_view(strokeWidth=0).configure(background="#0a0a0a")
     )
-    st.markdown(
-        f'<div class="rh-sub">최근 {len(pdf)}거래일 · '
-        f'<span style="color:{color};font-weight:600">{ret:+.1%}</span></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="rh-sub">최근 {len(pdf)}거래일 · '
+                f'<span style="color:{color};font-weight:600">{ret:+.1%}</span></div>', unsafe_allow_html=True)
     st.altair_chart(area, use_container_width=True)
 
 
@@ -220,12 +225,44 @@ def render_factor_bars(r: pd.Series) -> None:
     for key, label in FACTOR_KO.items():
         v = r[key] if pd.notna(r[key]) else 0.5
         pct = max(0, min(100, v * 100))
-        html += (
-            f'<div class="rh-bar-label"><span>{label}</span>'
-            f'<span style="color:#fff">{v:.2f}</span></div>'
-            f'<div class="rh-bar-track"><div class="rh-bar-fill" style="width:{pct:.0f}%"></div></div>'
-        )
+        html += (f'<div class="rh-bar-label"><span>{label}</span><span style="color:#fff">{v:.2f}</span></div>'
+                 f'<div class="rh-bar-track"><div class="rh-bar-fill" style="width:{pct:.0f}%"></div></div>')
     st.markdown(html, unsafe_allow_html=True)
+
+
+def render_reasoning(ticker: str, r: pd.Series) -> None:
+    reason = build_reasoning(load_prices(ticker), load_fundamentals(ticker), load_flows(ticker),
+                             prob_up=float(r["prob_up"]), composite=float(r["composite"]))
+    st.write("")
+    st.markdown('<div class="rh-sec">분석 근거 · 왜 이 확률인가</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="rh-sub" style="margin-bottom:8px">{reason.summary}</div>', unsafe_allow_html=True)
+
+    dots = {"pos": GREEN, "neg": RED, "neutral": MUTED}
+    if reason.drivers:
+        html = ""
+        for d in reason.drivers:
+            html += (f'<div class="rh-drv"><span style="color:{dots[d.polarity]};font-size:0.7rem">●</span> '
+                     f'<span style="color:#fff;font-weight:600">{d.label}</span> '
+                     f'<span style="color:{MUTED}">· {d.detail}</span></div>')
+        st.markdown(f'<div class="rh-card">{html}</div>', unsafe_allow_html=True)
+
+    if reason.financials:
+        st.write("")
+        st.markdown(f'<div class="rh-sec">재무제표 · {reason.financial_period}</div>', unsafe_allow_html=True)
+        rows = "".join(f'<div class="rh-fin"><span style="color:{MUTED}">{k}</span>'
+                       f'<span style="color:#fff;font-weight:600">{v}</span></div>' for k, v in reason.financials)
+        st.markdown(f'<div class="rh-card">{rows}</div>', unsafe_allow_html=True)
+
+    st.write("")
+    st.markdown('<div class="rh-sec">최근 뉴스</div>', unsafe_allow_html=True)
+    news = load_news(ticker)
+    if news:
+        nhtml = "".join(f'<div class="rh-news">📰 <a href="{n["url"]}" target="_blank">{n["title"]}</a></div>'
+                        for n in news[:6])
+        st.markdown(f'<div class="rh-card">{nhtml}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="rh-sub">최근 뉴스를 불러오지 못했습니다 (네트워크 제한 또는 데이터 없음).</div>',
+                    unsafe_allow_html=True)
 
 
 def _password_ok() -> bool:
@@ -269,24 +306,22 @@ def main() -> None:
     st.markdown(f'<div class="rh-title">한국 시장 · 주간 전망 {badge}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="rh-sub">ISO {week} · 투자 자문 아님</div>', unsafe_allow_html=True)
     st.write("")
-
     if df.empty:
         st.warning("데이터가 없습니다.")
         return
 
     top = df.iloc[0]
     c1, c2, c3 = st.columns(3)
-    c1.markdown(stat_block("최고 종합점수", f"{top['composite']:.1f}",
-                           f"{top['name']} {top['ticker']}", GREEN), unsafe_allow_html=True)
+    c1.markdown(stat_block("최고 종합점수", f"{top['composite']:.1f}", f"{top['name']} {top['ticker']}", GREEN), unsafe_allow_html=True)
     c2.markdown(stat_block("분석 종목 수", f"{len(df)}"), unsafe_allow_html=True)
     c3.markdown(stat_block("평균 상승확률", f"{df['prob_up'].mean():.0%}"), unsafe_allow_html=True)
 
     st.write("")
-    st.markdown('<div style="font-size:0.95rem;color:#fff;font-weight:700;margin-bottom:8px">종목 순위</div>', unsafe_allow_html=True)
+    st.markdown('<div class="rh-sec">종목 순위</div>', unsafe_allow_html=True)
     render_ranking(df)
 
     st.write("")
-    st.markdown('<div style="font-size:0.95rem;color:#fff;font-weight:700">종목 상세</div>', unsafe_allow_html=True)
+    st.markdown('<div class="rh-sec">종목 상세</div>', unsafe_allow_html=True)
     options = [f"{r['name']} ({r['ticker']})" for _, r in df.iterrows()]
     pick = st.selectbox("종목 선택", options, label_visibility="collapsed")
     ticker = pick[pick.rfind("(") + 1: pick.rfind(")")]
@@ -309,6 +344,7 @@ def main() -> None:
     st.write("")
     st.markdown('<div class="rh-stat-label" style="margin-bottom:2px">팩터 분석</div>', unsafe_allow_html=True)
     render_factor_bars(r)
+    render_reasoning(ticker, r)
     st.markdown(f'<div class="rh-disclaimer">{foot}</div>', unsafe_allow_html=True)
 
 
