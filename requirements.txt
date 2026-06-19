@@ -1,0 +1,10 @@
+# Streamlit Community Cloud installs from this file.
+# Intentionally light: the hosted demo runs on synthetic data only — no live
+# market APIs, no Anthropic calls — so a public link cannot incur API cost.
+streamlit>=1.36
+pandas>=2.1
+numpy>=1.26
+SQLAlchemy>=2.0
+pydantic>=2.6
+pydantic-settings>=2.2
+python-dotenv>=1.0

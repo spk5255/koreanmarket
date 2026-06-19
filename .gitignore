@@ -1,0 +1,40 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ─── Virtualenv ───
+.venv/
+venv/
+env/
+
+# ─── Secrets / config ───
+.env
+
+# ─── Data & generated artifacts (keep dirs, ignore contents) ───
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+reports/*
+!reports/.gitkeep
+
+# ─── Notebooks ───
+.ipynb_checkpoints/
+
+# ─── OS / editor ───
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
