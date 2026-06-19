@@ -53,9 +53,15 @@ def bootstrap() -> tuple[str, str]:
     if n_prices == 0:
         source = "real"
         try:
-            from src.ingestion.backfill import backfill_universe
-            if backfill_universe(years=REAL_YEARS, with_financials=True) == 0:
-                raise RuntimeError("no real data")
+            # 1) Prefer the committed real-data snapshot (works even when the host
+            #    can't reach KRX/DART). 2) else try live ingestion. 3) else synthetic.
+            from src.storage.snapshot import load_snapshot, snapshot_exists
+            if snapshot_exists() and load_snapshot() > 0:
+                pass
+            else:
+                from src.ingestion.backfill import backfill_universe
+                if backfill_universe(years=REAL_YEARS, with_financials=True) == 0:
+                    raise RuntimeError("no real data")
         except Exception:
             from scripts.seed_synthetic import main as seed_main
             sys.argv = ["seed_synthetic", "--years", str(DEMO_YEARS), "--seed", "42"]
