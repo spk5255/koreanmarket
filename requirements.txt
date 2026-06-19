@@ -1,6 +1,6 @@
 # Streamlit Community Cloud installs from this file.
-# Intentionally light: the hosted demo runs on synthetic data only — no live
-# market APIs, no Anthropic calls — so a public link cannot incur API cost.
+# Live market data path: pykrx (daily OHLCV) + OpenDartReader (DART fundamentals).
+# Anthropic is intentionally excluded so a public link incurs no API cost.
 streamlit>=1.36
 pandas>=2.1
 numpy>=1.26
@@ -8,3 +8,6 @@ SQLAlchemy>=2.0
 pydantic>=2.6
 pydantic-settings>=2.2
 python-dotenv>=1.0
+pykrx>=1.0.45
+OpenDartReader>=0.2.1
+lxml>=5.0

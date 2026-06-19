@@ -1,11 +1,14 @@
-"""Streamlit dashboard — Robinhood-style, fully Korean.
+"""Streamlit dashboard — Robinhood-style, Korean, REAL market data.
 
-Hosted demo entry point. On first load it seeds synthetic data and runs the
-pipeline (no live APIs, no Anthropic), then renders an app-like dark UI.
+On first load it tries live ingestion (pykrx daily OHLCV + DART fundamentals)
+and falls back to synthetic data if the host can't reach KRX/DART, so the link
+never breaks. The DART key is read from Streamlit secrets if present.
+No Anthropic calls are made, so a public link incurs no API cost.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -20,17 +23,27 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("streamlit not installed. pip install -e '.[dashboard]'") from exc
 
+# Bridge a Streamlit secret -> env BEFORE settings is imported, so live DART works on host.
+try:
+    if "DART_API_KEY" in st.secrets and not os.environ.get("DART_API_KEY"):
+        os.environ["DART_API_KEY"] = str(st.secrets["DART_API_KEY"])
+except Exception:
+    pass
+
 from sqlalchemy import func, select
 
+from config.settings import DATA_DIR
 from src.storage.db import init_db, session_scope
 from src.storage.models import Company, FactorScore, Price, Projection
 from src.storage.repository import get_prices
 from src.utils import iso_week_label
 
 DEMO_YEARS = 1.5
+REAL_YEARS = 1.0
 GREEN = "#00C805"
 RED = "#FF5000"
 MUTED = "#9b9b9b"
+MARKER = DATA_DIR / ".data_source"
 
 CONF_KO = {"low": "낮음", "medium": "보통", "high": "높음"}
 FACTOR_KO = {"fundamental": "펀더멘털", "technical": "기술적", "supply_demand": "수급", "sentiment": "심리"}
@@ -38,22 +51,37 @@ FACTOR_KO = {"fundamental": "펀더멘털", "technical": "기술적", "supply_de
 
 # ----------------------------------------------------------------- bootstrap ---
 
-@st.cache_resource(show_spinner="데모 데이터를 준비하는 중…")
-def bootstrap() -> str:
+@st.cache_resource(show_spinner="시장 데이터를 불러오는 중… (최초 1회, 실데이터는 다소 걸릴 수 있어요)")
+def bootstrap() -> tuple[str, str]:
     init_db()
     week = iso_week_label(date.today())
     with session_scope() as s:
         n_prices = s.scalar(select(func.count()).select_from(Price)) or 0
+
     if n_prices == 0:
-        from scripts.seed_synthetic import main as seed_main
-        sys.argv = ["seed_synthetic", "--years", str(DEMO_YEARS), "--seed", "42"]
-        seed_main()
+        source = "real"
+        try:
+            from src.ingestion.backfill import backfill_universe
+            if backfill_universe(years=REAL_YEARS, with_financials=True) == 0:
+                raise RuntimeError("no real data returned")
+        except Exception:
+            from scripts.seed_synthetic import main as seed_main
+            sys.argv = ["seed_synthetic", "--years", str(DEMO_YEARS), "--seed", "42"]
+            seed_main()
+            source = "synthetic"
+        try:
+            MARKER.write_text(source, encoding="utf-8")
+        except Exception:
+            pass
+    else:
+        source = MARKER.read_text(encoding="utf-8").strip() if MARKER.exists() else "real"
+
     with session_scope() as s:
         n_week = s.scalar(select(func.count()).select_from(Projection).where(Projection.week == week)) or 0
     if n_week == 0:
         from src.scheduler.weekly_job import run_once
         run_once(week=week)
-    return week
+    return week, source
 
 
 @st.cache_data(ttl=120)
@@ -103,6 +131,8 @@ def inject_css() -> None:
     .block-container {{ padding-top: 1.5rem; padding-bottom: 3rem; max-width: 880px; }}
     .rh-title {{ font-size: 1.6rem; font-weight: 800; color: #fff; letter-spacing: -0.5px; }}
     .rh-sub {{ color: {MUTED}; font-size: 0.85rem; margin-top: 2px; }}
+    .rh-badge {{ display:inline-block; font-size:0.72rem; font-weight:700; padding:2px 9px;
+                border-radius:20px; margin-left:6px; }}
     .rh-stat-label {{ color: {MUTED}; font-size: 0.78rem; font-weight: 500; }}
     .rh-stat-value {{ color: #fff; font-size: 1.9rem; font-weight: 700; letter-spacing: -1px; line-height: 1.1; }}
     .rh-card {{ background: #131720; border: 1px solid #1f2429; border-radius: 14px; padding: 6px 14px; }}
@@ -113,13 +143,13 @@ def inject_css() -> None:
     .rh-score {{ font-weight:700; font-size:1.15rem; text-align:right; }}
     .rh-prob {{ font-size:0.78rem; font-weight:600; text-align:right; margin-top:1px; }}
     .rh-chip {{ display:inline-block; background:#131720; border:1px solid #1f2429; border-radius:10px;
-               padding:8px 14px; margin-right:8px; }}
+               padding:8px 14px; margin-right:8px; margin-bottom:6px; }}
     .rh-chip-label {{ color:{MUTED}; font-size:0.7rem; }}
     .rh-chip-val {{ color:#fff; font-weight:700; font-size:1.05rem; }}
     .rh-bar-track {{ background:#1a1f25; border-radius:6px; height:8px; width:100%; overflow:hidden; }}
     .rh-bar-fill {{ background:{GREEN}; height:8px; border-radius:6px; }}
     .rh-bar-label {{ color:{MUTED}; font-size:0.8rem; display:flex; justify-content:space-between; margin:10px 0 4px; }}
-    .rh-disclaimer {{ color:#6b7280; font-size:0.72rem; margin-top:6px; }}
+    .rh-disclaimer {{ color:#6b7280; font-size:0.72rem; margin-top:14px; }}
     div[data-baseweb="select"] > div {{ background:#131720; border-color:#1f2429; }}
     </style>
     """, unsafe_allow_html=True)
@@ -172,10 +202,7 @@ def render_price_chart(ticker: str) -> None:
             ),
             opacity=0.25,
         )
-        .encode(
-            x=alt.X("date:T", axis=None),
-            y=alt.Y("close:Q", axis=None, scale=alt.Scale(zero=False)),
-        )
+        .encode(x=alt.X("date:T", axis=None), y=alt.Y("close:Q", axis=None, scale=alt.Scale(zero=False)))
         .properties(height=170)
         .configure_view(strokeWidth=0)
         .configure(background="#0a0a0a")
@@ -206,9 +233,7 @@ def _password_ok() -> bool:
         pw = st.secrets.get("app_password")
     except Exception:
         pw = None
-    if not pw:
-        return True
-    if st.session_state.get("authed"):
+    if not pw or st.session_state.get("authed"):
         return True
     entered = st.text_input("비밀번호", type="password")
     if entered == pw:
@@ -231,14 +256,18 @@ def main() -> None:
     if not _password_ok():
         st.stop()
 
-    week = bootstrap()
+    week, source = bootstrap()
     df = load_ranking(week)
 
-    st.markdown('<div class="rh-title">한국 시장 · 주간 전망</div>', unsafe_allow_html=True)
-    st.markdown(
-        f'<div class="rh-sub">ISO {week} · 합성 데이터 데모 · 투자 자문 아님</div>',
-        unsafe_allow_html=True,
-    )
+    if source == "real":
+        badge = f'<span class="rh-badge" style="background:{GREEN};color:#000">실데이터 · 일간 시세</span>'
+        foot = "※ 한국거래소(KRX)·DART의 실제 일간 시세/재무 데이터 기반 리서치 도구입니다. 실시간(체결) 데이터가 아니며 투자 자문이 아닙니다."
+    else:
+        badge = f'<span class="rh-badge" style="background:#2a2f36;color:{MUTED}">데모 · 합성 데이터</span>'
+        foot = "※ 합성(가상) 데이터로 모델을 시연하는 리서치 도구입니다. 실제 시장 데이터가 아니며 투자 자문이 아닙니다."
+
+    st.markdown(f'<div class="rh-title">한국 시장 · 주간 전망 {badge}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="rh-sub">ISO {week} · 투자 자문 아님</div>', unsafe_allow_html=True)
     st.write("")
 
     if df.empty:
@@ -253,45 +282,34 @@ def main() -> None:
     c3.markdown(stat_block("평균 상승확률", f"{df['prob_up'].mean():.0%}"), unsafe_allow_html=True)
 
     st.write("")
-    st.markdown('<div class="rh-stat-label" style="font-size:0.95rem;color:#fff;font-weight:700;margin-bottom:8px">종목 순위</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.95rem;color:#fff;font-weight:700;margin-bottom:8px">종목 순위</div>', unsafe_allow_html=True)
     render_ranking(df)
 
     st.write("")
-    st.markdown('<div class="rh-stat-label" style="font-size:0.95rem;color:#fff;font-weight:700">종목 상세</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.95rem;color:#fff;font-weight:700">종목 상세</div>', unsafe_allow_html=True)
     options = [f"{r['name']} ({r['ticker']})" for _, r in df.iterrows()]
     pick = st.selectbox("종목 선택", options, label_visibility="collapsed")
     ticker = pick[pick.rfind("(") + 1: pick.rfind(")")]
     r = df[df["ticker"] == ticker].iloc[0]
 
-    cc = _score_color(r["composite"])
-    st.markdown(stat_block("종합점수", f"{r['composite']:.1f}", "", cc), unsafe_allow_html=True)
+    st.markdown(stat_block("종합점수", f"{r['composite']:.1f}", "", _score_color(r["composite"])), unsafe_allow_html=True)
     render_price_chart(ticker)
 
     st.write("")
     up = pd.notna(r["prob_up"]) and r["prob_up"] >= 0.5
     chips = (
-        f'<span class="rh-chip"><div class="rh-chip-label">기준</div>'
-        f'<div class="rh-chip-val">{_won(r["base"])}</div></span>'
-        f'<span class="rh-chip"><div class="rh-chip-label">강세</div>'
-        f'<div class="rh-chip-val" style="color:{GREEN}">{_won(r["bull"])}</div></span>'
-        f'<span class="rh-chip"><div class="rh-chip-label">약세</div>'
-        f'<div class="rh-chip-val" style="color:{RED}">{_won(r["bear"])}</div></span>'
-        f'<span class="rh-chip"><div class="rh-chip-label">상승확률</div>'
-        f'<div class="rh-chip-val" style="color:{GREEN if up else RED}">{r["prob_up"]:.0%}</div></span>'
-        f'<span class="rh-chip"><div class="rh-chip-label">신뢰도</div>'
-        f'<div class="rh-chip-val">{CONF_KO.get(str(r["confidence"]), r["confidence"])}</div></span>'
+        f'<span class="rh-chip"><div class="rh-chip-label">기준</div><div class="rh-chip-val">{_won(r["base"])}</div></span>'
+        f'<span class="rh-chip"><div class="rh-chip-label">강세</div><div class="rh-chip-val" style="color:{GREEN}">{_won(r["bull"])}</div></span>'
+        f'<span class="rh-chip"><div class="rh-chip-label">약세</div><div class="rh-chip-val" style="color:{RED}">{_won(r["bear"])}</div></span>'
+        f'<span class="rh-chip"><div class="rh-chip-label">상승확률</div><div class="rh-chip-val" style="color:{GREEN if up else RED}">{r["prob_up"]:.0%}</div></span>'
+        f'<span class="rh-chip"><div class="rh-chip-label">신뢰도</div><div class="rh-chip-val">{CONF_KO.get(str(r["confidence"]), r["confidence"])}</div></span>'
     )
     st.markdown(chips, unsafe_allow_html=True)
 
     st.write("")
     st.markdown('<div class="rh-stat-label" style="margin-bottom:2px">팩터 분석</div>', unsafe_allow_html=True)
     render_factor_bars(r)
-
-    st.markdown(
-        '<div class="rh-disclaimer">※ 본 화면은 합성(가상) 데이터로 모델을 시연하기 위한 리서치 도구입니다. '
-        '실제 시장 데이터가 아니며 투자 자문이 아닙니다.</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="rh-disclaimer">{foot}</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
